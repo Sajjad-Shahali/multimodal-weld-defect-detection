@@ -341,6 +341,10 @@ def build_dataloaders(cfg, load_video=False, *, use_sensor=True):
         cw = cw / s * n_present
     class_weights = torch.tensor(cw, dtype=torch.float32)
 
+    # Clamp max weight to 2.0 — prevents minority-class over-compensation
+    # that causes the model to hallucinate rare defects on good welds.
+    class_weights = torch.clamp(class_weights, max=2.0)
+
     print(f"  Train: {len(train_ds)} chunks  |  Val: {len(val_ds)} chunks")
     print(f"  Batch size: {batch_size}  |  Video: {'ON' if load_video else 'OFF'}")
     print(f"  DataLoader: num_workers={num_workers}, pin_memory={pin_memory}")

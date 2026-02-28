@@ -81,7 +81,7 @@ training:
   weight_decay: 0.0001
   gradient_clip: 1.0
   # Loss
-  focal_gamma: 2.0
+  focal_gamma: 1.0            # lowered from 2.0 — reduce aggressive hard-example upweighting
   mtl_alpha: 0.7           # weight for multi-class focal loss
   mtl_beta: 0.3            # weight for binary BCE loss
   # Video

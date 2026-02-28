@@ -38,5 +38,23 @@ dashboard:
   predictions: outputs/predictions
   reports: outputs/reports
   dataset: data/interim
-  sample_data: /Users/kiana/Desktop/08-17-22-0011-00
-  sensor_stats: /Users/kiana/Library/Containers/ru.keepcoder.Telegram/Data/tmp/sensor_stats.csv
+  # Live Sync: path(s) to run folders. Use dropdown in Live Sync to choose between available runs.
+  sample_data: assets/sample_data
+  sensor_stats: data/interim/sensor_stats.csv
+  # Top-15 Insights panel data sources
+  top15_csv: data/processed/dashboard_top15_features.csv
+  top15_summary: data/processed/dashboard_feature_summary.json
+  feature_importance: outputs/tabular/feature_importance.csv
+  audit_bias: outputs/audit_metadata_bias_report.json
+  audit_duplicates: outputs/audit_duplicates_report.json
+  class_weights: outputs/tabular/class_weights.json
+  alignment_summary: D:/hachaton/multimodal-weld-defect-detection/output/alignment_summary.csv
+  eval_val_predictions: outputs/eval/val_predictions.csv
+  eval_val_metrics: outputs/eval/val_metrics.json
+  eval_per_class: outputs/eval/per_class_report.csv
+  tabular_val_metrics: outputs/tabular/val_metrics.json
+  inference_predictions: outputs/predictions/predictions.csv
+  # Live inference model artefacts
+  checkpoint: D:/hachaton/multimodal-weld-defect-detection/output/checkpoints/best_model.pt
+  norm_stats_inf: D:/hachaton/multimodal-weld-defect-detection/output/dataset/norm_stats.json
+  pipeline_config: D:/hachaton/multimodal-weld-defect-detection/config.yaml
