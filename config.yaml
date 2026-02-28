@@ -65,6 +65,12 @@ tabular:
   seed: 42
 
 # --- Tier 2: WeldFusionNet (neural, multimodal) ---
+modalities:
+  # Neural training/evaluation modalities.
+  # Set use_sensor: false to train/evaluate with audio(+video) only.
+  # CSV ingestion remains available for other steps/experiments.
+  use_sensor: false
+
 training:
   seed: 42
   batch_size: 16                     # lowered from 32 — video branch with

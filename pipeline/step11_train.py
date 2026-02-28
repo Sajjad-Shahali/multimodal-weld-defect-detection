@@ -40,10 +40,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import f1_score
 
-print(torch.__version__)
-print(torch.version.cuda)
-print(torch.cuda.get_device_name(0))
-print(torch.cuda.get_device_capability(0))  # should show (12, 0)
+
 from pipeline.utils import load_config, ensure_dir
 from pipeline.step8_dataset_torch import build_dataloaders, CLASSES_WITH_DATA
 from pipeline.step9_model import build_model, NUM_CLASSES
@@ -71,7 +68,18 @@ def remap_labels(labels_original):
 
 # ── Training one epoch ──────────────────────────────────────────────
 
-def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, grad_clip):
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scheduler,
+    device,
+    grad_clip,
+    *,
+    epoch=None,
+    progress_every=0,
+):
     """Train for one epoch. Returns dict of average losses."""
     model.train()
     total_loss = 0.0
@@ -79,8 +87,10 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, grad
     bce_sum = 0.0
     n_batches = 0
 
-    for batch in loader:
-        sensor = batch["sensor"].to(device)
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+
+    for batch_idx, batch in enumerate(loader, start=1):
+        sensor = batch["sensor"].to(device) if getattr(model, "use_sensor", True) else None
         audio = batch["audio"].to(device)
         video = batch["video"].to(device) if model.use_video else None
         labels_orig = batch["label"].to(device)
@@ -109,6 +119,30 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, grad
         bce_sum += details["bce"]
         n_batches += 1
 
+        if progress_every and (batch_idx == 1 or batch_idx % progress_every == 0):
+            denom = max(n_batches, 1)
+            avg_total = total_loss / denom
+            avg_focal = focal_sum / denom
+            avg_bce = bce_sum / denom
+            if total_batches is not None and epoch is not None:
+                print(
+                    f"    epoch {epoch} train batch {batch_idx}/{total_batches} "
+                    f"loss={avg_total:.4f} focal={avg_focal:.4f} bce={avg_bce:.4f}",
+                    flush=True,
+                )
+            elif total_batches is not None:
+                print(
+                    f"    train batch {batch_idx}/{total_batches} "
+                    f"loss={avg_total:.4f} focal={avg_focal:.4f} bce={avg_bce:.4f}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"    train batch {batch_idx} "
+                    f"loss={avg_total:.4f} focal={avg_focal:.4f} bce={avg_bce:.4f}",
+                    flush=True,
+                )
+
     if n_batches == 0:
         return {"loss": 0, "focal": 0, "bce": 0}
 
@@ -122,7 +156,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, grad
 # ── Validation ──────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, *, epoch=None, progress_every=0):
     """
     Validate and return metrics dict + raw predictions for calibration.
     """
@@ -133,8 +167,10 @@ def validate(model, loader, criterion, device):
     total_loss = 0.0
     n_batches = 0
 
-    for batch in loader:
-        sensor = batch["sensor"].to(device)
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+
+    for batch_idx, batch in enumerate(loader, start=1):
+        sensor = batch["sensor"].to(device) if getattr(model, "use_sensor", True) else None
         audio = batch["audio"].to(device)
         video = batch["video"].to(device) if model.use_video else None
         labels_orig = batch["label"].to(device)
@@ -152,6 +188,21 @@ def validate(model, loader, criterion, device):
         all_probs.append(probs.cpu())
         total_loss += loss.item()
         n_batches += 1
+
+        if progress_every and (batch_idx == 1 or batch_idx % progress_every == 0):
+            avg_vloss = total_loss / max(n_batches, 1)
+            if total_batches is not None and epoch is not None:
+                print(
+                    f"    epoch {epoch} val batch {batch_idx}/{total_batches} vloss={avg_vloss:.4f}",
+                    flush=True,
+                )
+            elif total_batches is not None:
+                print(
+                    f"    val batch {batch_idx}/{total_batches} vloss={avg_vloss:.4f}",
+                    flush=True,
+                )
+            else:
+                print(f"    val batch {batch_idx} vloss={avg_vloss:.4f}", flush=True)
 
     all_labels = torch.cat(all_labels).numpy()
     all_preds = torch.cat(all_preds).numpy()
@@ -200,6 +251,9 @@ def run(config_path="config.yaml", use_video=False):
     cfg = load_config(config_path)
     tcfg = cfg.get("training", {})
 
+    mcfg = cfg.get("modalities", {}) or {}
+    use_sensor = bool(mcfg.get("use_sensor", tcfg.get("use_sensor", True)))
+
     # Seed everything
     seed = tcfg.get("seed", 42)
     torch.manual_seed(seed)
@@ -223,15 +277,26 @@ def run(config_path="config.yaml", use_video=False):
         device = torch.device("mps")
     print(f"  Device: {device}")
 
+    # Progress printing:
+    # - If training.progress_every_batches is set (>0), always use it.
+    # - Otherwise, when running with INFO logging (e.g. run_all --verbose), enable a
+    #   reasonable default so long epochs don't look frozen.
+    configured_every = int(tcfg.get("progress_every_batches", 0) or 0)
+    if configured_every > 0:
+        progress_every = configured_every
+    else:
+        batch_progress = logging.getLogger().isEnabledFor(logging.INFO)
+        progress_every = 50 if batch_progress else 0
+
     # ── 1. Build DataLoaders ────────────────────────────────────────
     print("\n  ── Building DataLoaders ──")
     train_loader, val_loader, norm_stats, class_weights = build_dataloaders(
-        cfg, load_video=use_video,
+        cfg, load_video=use_video, use_sensor=use_sensor,
     )
 
     # ── 2. Build Model ──────────────────────────────────────────────
     print("\n  ── Building Model ──")
-    model = build_model(cfg, use_video=use_video)
+    model = build_model(cfg, use_video=use_video, use_sensor=use_sensor)
     model = model.to(device)
 
     # ── 3. Build Loss ───────────────────────────────────────────────
@@ -293,11 +358,15 @@ def run(config_path="config.yaml", use_video=False):
         # Train
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, device, grad_clip,
+            epoch=epoch,
+            progress_every=progress_every,
         )
 
         # Validate
         val_metrics, val_labels, val_probs = validate(
             model, val_loader, criterion, device,
+            epoch=epoch,
+            progress_every=progress_every,
         )
 
         # Current LR
@@ -338,6 +407,7 @@ def run(config_path="config.yaml", use_video=False):
                 "norm_stats": norm_stats,
                 "config": cfg,
                 "use_video": use_video,
+                "use_sensor": use_sensor,
             }, os.path.join(ckpt_dir, "best_model.pt"))
             print(f"    ★ New best! FinalScore={best_score:.4f}")
         else:
@@ -360,6 +430,7 @@ def run(config_path="config.yaml", use_video=False):
         "training_time_sec": round(elapsed, 1),
         "device": str(device),
         "use_video": use_video,
+        "use_sensor": use_sensor,
     }
     with open(os.path.join(ckpt_dir, "training_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)

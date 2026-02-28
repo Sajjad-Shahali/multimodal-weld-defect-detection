@@ -1,33 +1,41 @@
 """
-step14_inference.py — Test-set prediction → submission CSV.
+step14_inference.py — Inference on test / sample data with evaluation.
 
 Purpose
 -------
-Process the 90 anonymised test samples (sample_0001 … sample_0090):
-  1. For each sample, run the same preprocessing as training
-     (sensor interpolation, audio features, video frame indices, chunking).
-  2. Feed chunks through the trained model.
-  3. Aggregate chunk-level predictions to one per sample.
-  4. Apply temperature scaling.
-  5. Write the submission CSV in the exact required format.
+Two modes of operation:
 
-Submission schema (required):
-    sample_id,pred_label_code,p_defect
+  MODE 1 — Holdout test split (default, recommended):
+      Evaluates the model on chunks already produced by step6 whose
+      run_ids are listed under "test" in split_dict.json.
+      Uses the same pre-computed .npz chunks and norm_stats as training.
+      No --test-dir needed — just run:
+          python -m pipeline.step14_inference --config config.yaml
+
+  MODE 2 — External directory (legacy / sampleData):
+      Processes raw run directories from scratch (step2→step3→step6
+      feature pipeline inline).
+      Triggered by passing --test-dir:
+          python -m pipeline.step14_inference --config config.yaml \
+              --test-dir /path/to/sampleData
 
 Input
 -----
-  test_data/sample_XXXX/ — each containing sensor.csv, weld.flac, weld.avi
-  output/checkpoints/best_model.pt (with temperature)
+  output/checkpoints/best_model.pt  (with temperature)
   output/dataset/norm_stats.json
+  output/dataset/split_dict.json    (for MODE 1)
 
 Output
 ------
-  output/submission.csv   — 90 rows, hackathon submission file
+  output/inference/
+      predictions.csv      — one row per run: run_id, true/pred label, probs
+      metrics.json          — if labels available: F1, accuracy, confusion
+      confusion_matrix.png  — multi-class confusion matrix
 
 Usage
 -----
-  python -m pipeline.step14_inference
   python -m pipeline.step14_inference --config config.yaml
+  python -m pipeline.step14_inference --config config.yaml --test-dir /path/to/sampleData
 """
 
 import argparse
@@ -35,114 +43,92 @@ import csv
 import json
 import logging
 import os
-import re
 
 import cv2
 import librosa
 import numpy as np
+import pandas as pd
 import soundfile as sf
 import torch
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    f1_score,
+)
 
 from pipeline.utils import load_config, ensure_dir
+from pipeline.step2_sensor import load_sensor_csv, detect_weld_active, add_derived_features
+from pipeline.step6_dataset import (
+    MASTER_FPS,
+    CHUNK_FRAMES,
+    SENSOR_DROP,
+    compute_video_frame_indices,
+)
 from pipeline.step9_model import build_model, NUM_CLASSES
-from pipeline.step11_train import IDX_TO_CODE
+from pipeline.step11_train import IDX_TO_CODE, CODE_TO_IDX, CLASSES_WITH_DATA
+from pipeline.step12_calibrate import expected_calibration_error
+from pipeline.step8_dataset_torch import build_test_loader, build_dataloaders
 
 log = logging.getLogger(__name__)
 
-# ── Same constants as step6 ─────────────────────────────────────────
-MASTER_FPS   = 25
-CHUNK_SEC    = 1
-CHUNK_FRAMES = MASTER_FPS * CHUNK_SEC
-
-# Sensor columns to drop (same as step6)
-SENSOR_DROP = {"Date", "Time", "Part No", "Remarks", "weld_active"}
-
 
 # ═══════════════════════════════════════════════════════════════════
-#  Lightweight preprocessing helpers (mirror step2/3/6)
+#  Preprocessing: raw run dir → list of normalised chunk tensors
 # ═══════════════════════════════════════════════════════════════════
 
-def _load_test_sensor(csv_path, threshold=5.0):
+def _enrich_sensor(csv_path, feature_cols, threshold=5.0):
     """
-    Load test sensor CSV, compute elapsed_sec, find weld-active window,
-    add derived features, return (dataframe, t_start, t_end).
-
-    Test CSVs lack 'Part No' column — handle gracefully.
+    Replicate step2 enrichment on a raw sensor CSV.
+    Returns: (enriched_df, t_start, t_end)
     """
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-    df.columns = df.columns.str.strip()
-
-    # Compute elapsed_sec
-    times = pd.to_timedelta(df["Time"].astype(str))
-    df["elapsed_sec"] = (times - times.iloc[0]).dt.total_seconds()
-
-    # Numeric feature columns (exclude metadata)
-    drop = {"Date", "Time", "Part No", "Remarks", "elapsed_sec"}
-    feat_cols = [c for c in df.columns if c not in drop
-                 and pd.api.types.is_numeric_dtype(df[c])]
-
-    # Detect weld-active window
-    if "Primary Weld Current" in df.columns:
-        mask = df["Primary Weld Current"] > threshold
-        active = df.index[mask]
-        if len(active) == 0:
-            # Fallback: use entire signal
-            start_idx, end_idx = 0, len(df) - 1
-        else:
-            start_idx, end_idx = int(active[0]), int(active[-1])
-    else:
-        start_idx, end_idx = 0, len(df) - 1
+    df = load_sensor_csv(csv_path)
+    start_idx, end_idx = detect_weld_active(df, threshold)
 
     t_start = float(df.loc[start_idx, "elapsed_sec"])
-    t_end   = float(df.loc[end_idx,   "elapsed_sec"])
+    t_end = float(df.loc[end_idx, "elapsed_sec"])
 
-    # Add derived features (mirror step2)
-    dt = df["elapsed_sec"].diff().replace(0, np.nan)
-    for col in feat_cols:
-        df[f"{col}_deriv"]   = df[col].diff() / dt
-        df[f"{col}_rmean10"] = df[col].rolling(10, min_periods=1).mean()
-        df[f"{col}_rstd10"]  = df[col].rolling(10, min_periods=1).std().fillna(0)
+    df = add_derived_features(df, feature_cols)
+    df["weld_active"] = 0
+    df.loc[start_idx:end_idx, "weld_active"] = 1
 
-    if "Wire Consumed" in df.columns:
-        df["wire_feed_rate"] = df["Wire Consumed"].diff() / dt
-    if "Primary Weld Current" in df.columns and "Secondary Weld Voltage" in df.columns:
-        voltage = df["Secondary Weld Voltage"].replace(0, np.nan)
-        df["current_voltage_ratio"] = df["Primary Weld Current"] / voltage
-
-    df = df.fillna(0)
-
-    return df, t_start, t_end, feat_cols
+    return df, t_start, t_end
 
 
-def _interpolate_sensor(df, master_times):
-    """Interpolate all numeric derived columns onto master timeline."""
-    drop = {"Date", "Time", "Part No", "Remarks", "weld_active", "elapsed_sec"}
-    import pandas as pd
+def _interpolate_enriched_sensor(df, master_times):
+    """
+    Interpolate all numeric columns from the enriched sensor DF
+    onto master_times. Mirrors step6.interpolate_sensor but works
+    from an in-memory DataFrame instead of a CSV file.
+    """
     keep = [c for c in df.columns
-            if c not in drop and pd.api.types.is_numeric_dtype(df[c])]
+            if c not in SENSOR_DROP and c != "elapsed_sec"
+            and pd.api.types.is_numeric_dtype(df[c])]
 
     src_times = df["elapsed_sec"].values
     out = np.zeros((len(master_times), len(keep)), dtype=np.float32)
+
     for i, col in enumerate(keep):
         out[:, i] = np.interp(master_times, src_times, df[col].values)
-    return out
+
+    return out, keep
 
 
 def _extract_audio_features(flac_path, master_times, sr=16000, hop_length=512,
-                             n_fft=2048, n_mfcc=13):
-    """Load FLAC, compute MFCCs + spectral features, align to master timeline."""
+                            n_fft=2048, n_mfcc=13):
+    """
+    Replicate step3 audio feature extraction inline and align to master_times.
+    Returns: ndarray (len(master_times), 18)
+    """
     y, actual_sr = sf.read(flac_path)
     y = y.astype(np.float32)
 
     mfccs = librosa.feature.mfcc(y=y, sr=actual_sr, n_mfcc=n_mfcc,
                                   n_fft=n_fft, hop_length=hop_length)
-    rms   = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-    sc    = librosa.feature.spectral_centroid(y=y, sr=actual_sr, hop_length=hop_length)[0]
-    sb    = librosa.feature.spectral_bandwidth(y=y, sr=actual_sr, hop_length=hop_length)[0]
-    zcr   = librosa.feature.zero_crossing_rate(y=y, hop_length=hop_length)[0]
-    sr_   = librosa.feature.spectral_rolloff(y=y, sr=actual_sr, hop_length=hop_length)[0]
+    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+    sc = librosa.feature.spectral_centroid(y=y, sr=actual_sr, hop_length=hop_length)[0]
+    sb = librosa.feature.spectral_bandwidth(y=y, sr=actual_sr, hop_length=hop_length)[0]
+    zcr = librosa.feature.zero_crossing_rate(y=y, hop_length=hop_length)[0]
+    sr_ = librosa.feature.spectral_rolloff(y=y, sr=actual_sr, hop_length=hop_length)[0]
 
     n_audio_frames = mfccs.shape[1]
     audio_times = np.arange(n_audio_frames) * (hop_length / actual_sr)
@@ -161,66 +147,54 @@ def _extract_audio_features(flac_path, master_times, sr=16000, hop_length=512,
     return audio_matrix[indices]
 
 
-def _compute_video_indices(avi_path, master_times):
-    """Compute video frame indices without decoding."""
-    cap = cv2.VideoCapture(avi_path)
-    native_fps   = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-
-    src_indices = np.round(master_times * native_fps).astype(np.int32)
-    src_indices = np.clip(src_indices, 0, max(total_frames - 1, 0))
-    return src_indices
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Preprocess one test sample → list of chunks
-# ═══════════════════════════════════════════════════════════════════
-
-def preprocess_test_sample(sample_dir, cfg):
+def preprocess_run(run_dir, run_id, cfg):
     """
-    Run the full sensor+audio+video preprocessing pipeline on one
-    test sample.  Returns a list of chunk dicts compatible with the
-    training Dataset format.
+    Full preprocessing of one run directory → list of chunk dicts.
+    Replicates step2 → step3 → step6 inline.
+
+    Returns: list of dicts with keys [sensor, audio, video_frame_indices, avi_path, chunk_idx]
+             Each sensor is (25, n_feat), audio is (25, 18).
     """
-    acfg = cfg.get("audio", {})
-    sensor_csv = os.path.join(sample_dir, "sensor.csv")
-    flac_path  = os.path.join(sample_dir, "weld.flac")
-    avi_path   = os.path.join(sample_dir, "weld.avi")
+    feat_cols = cfg["sensor"]["numeric_columns"]
+    threshold = cfg["sensor"]["weld_active_current_threshold"]
+    acfg = cfg["audio"]
 
-    threshold = cfg.get("sensor", {}).get("weld_active_current_threshold", 5.0)
-    sr        = acfg.get("target_sr", 16000)
-    hop       = acfg.get("hop_length", 512)
-    n_fft     = acfg.get("n_fft", 2048)
-    n_mfcc    = acfg.get("n_mfcc", 13)
+    csv_path = os.path.join(run_dir, f"{run_id}.csv")
+    flac_path = os.path.join(run_dir, f"{run_id}.flac")
+    avi_path = os.path.join(run_dir, f"{run_id}.avi")
 
-    # 1. Sensor
-    df, t_start, t_end, feat_cols = _load_test_sensor(sensor_csv, threshold)
+    # 1. Sensor enrichment (step2)
+    df, t_start, t_end = _enrich_sensor(csv_path, feat_cols, threshold)
 
+    # 2. Master timeline
     n_master = int((t_end - t_start) * MASTER_FPS)
     if n_master < 1:
-        n_master = CHUNK_FRAMES  # fallback: 1 second
-
+        n_master = CHUNK_FRAMES
     master_times = np.linspace(t_start, t_end, n_master, endpoint=False)
 
-    # 2. Sensor interpolation
-    sensor_arr = _interpolate_sensor(df, master_times)
+    # 3a. Sensor interpolation (step6)
+    sensor_arr, sensor_cols = _interpolate_enriched_sensor(df, master_times)
 
-    # 3. Audio features
-    audio_arr = _extract_audio_features(flac_path, master_times, sr, hop, n_fft, n_mfcc)
+    # 3b. Audio features (step3 + alignment)
+    audio_arr = _extract_audio_features(
+        flac_path, master_times,
+        sr=acfg["target_sr"],
+        hop_length=acfg["hop_length"],
+        n_fft=acfg["n_fft"],
+        n_mfcc=acfg["n_mfcc"],
+    )
 
-    # 4. Video indices
-    video_indices = _compute_video_indices(avi_path, master_times)
+    # 3c. Video frame indices
+    video_indices = compute_video_frame_indices(avi_path, master_times)
 
-    # 5. Pad short runs
+    # 4. Pad short runs
     if n_master < CHUNK_FRAMES:
         pad_len = CHUNK_FRAMES - n_master
-        sensor_arr    = np.pad(sensor_arr,    ((0, pad_len), (0, 0)), mode="constant")
-        audio_arr     = np.pad(audio_arr,     ((0, pad_len), (0, 0)), mode="constant")
-        video_indices = np.pad(video_indices,  (0, pad_len),          mode="constant",
-                               constant_values=-1)
+        sensor_arr = np.pad(sensor_arr, ((0, pad_len), (0, 0)), mode="edge")
+        audio_arr = np.pad(audio_arr, ((0, pad_len), (0, 0)), mode="edge")
+        video_indices = np.pad(video_indices, (0, pad_len), mode="edge")
 
-    # 6. Chunk
+    # 5. Chunk
     n_total = sensor_arr.shape[0]
     n_chunks = max(1, n_total // CHUNK_FRAMES)
     chunks = []
@@ -228,71 +202,65 @@ def preprocess_test_sample(sample_dir, cfg):
         lo = c * CHUNK_FRAMES
         hi = lo + CHUNK_FRAMES
         chunks.append({
-            "sensor":              sensor_arr[lo:hi],
-            "audio":               audio_arr[lo:hi],
+            "sensor": sensor_arr[lo:hi],
+            "audio": audio_arr[lo:hi],
             "video_frame_indices": video_indices[lo:hi],
-            "avi_path":            avi_path,
-            "chunk_idx":           c,
+            "avi_path": avi_path,
+            "chunk_idx": c,
         })
-    return chunks
+
+    return chunks, sensor_cols
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Normalise a chunk for model input (matches step8 WeldChunkDataset)
+#  Normalisation (same as step8 WeldChunkDataset)
 # ═══════════════════════════════════════════════════════════════════
 
 def normalize_chunk(chunk, norm_stats):
     """
-    Apply z-score normalization and transpose to channels-first
-    (same as step8 WeldChunkDataset).
+    Apply z-score normalization and transpose to channels-first.
+    Handles feature dimension mismatches gracefully.
     """
     sensor = chunk["sensor"].astype(np.float32)
-    audio  = chunk["audio"].astype(np.float32)
+    audio = chunk["audio"].astype(np.float32)
 
     s_mean = np.array(norm_stats["sensor_mean"], dtype=np.float32)
-    s_std  = np.array(norm_stats["sensor_std"],  dtype=np.float32)
-    a_mean = np.array(norm_stats["audio_mean"],  dtype=np.float32)
-    a_std  = np.array(norm_stats["audio_std"],   dtype=np.float32)
+    s_std = np.array(norm_stats["sensor_std"], dtype=np.float32)
+    a_mean = np.array(norm_stats["audio_mean"], dtype=np.float32)
+    a_std = np.array(norm_stats["audio_std"], dtype=np.float32)
 
-    # Handle feature dimension mismatch gracefully
-    # (test CSVs may have fewer columns if Part No is absent)
-    if sensor.shape[1] < len(s_mean):
-        # Pad with zeros to match expected dimension
-        pad_w = len(s_mean) - sensor.shape[1]
-        sensor = np.pad(sensor, ((0, 0), (0, pad_w)), mode="constant")
-    elif sensor.shape[1] > len(s_mean):
-        # Trim extra columns
-        sensor = sensor[:, :len(s_mean)]
+    # Handle sensor feature dimension mismatch
+    expected_s = len(s_mean)
+    if sensor.shape[1] < expected_s:
+        sensor = np.pad(sensor, ((0, 0), (0, expected_s - sensor.shape[1])), mode="constant")
+    elif sensor.shape[1] > expected_s:
+        sensor = sensor[:, :expected_s]
 
     sensor = (sensor - s_mean) / s_std
 
-    if audio.shape[1] < len(a_mean):
-        pad_w = len(a_mean) - audio.shape[1]
-        audio = np.pad(audio, ((0, 0), (0, pad_w)), mode="constant")
-    elif audio.shape[1] > len(a_mean):
-        audio = audio[:, :len(a_mean)]
+    # Handle audio feature dimension mismatch
+    expected_a = len(a_mean)
+    if audio.shape[1] < expected_a:
+        audio = np.pad(audio, ((0, 0), (0, expected_a - audio.shape[1])), mode="constant")
+    elif audio.shape[1] > expected_a:
+        audio = audio[:, :expected_a]
 
     audio = (audio - a_mean) / a_std
 
-    # Channels-first: (features, timesteps) for Conv1d
+    # Channels-first for Conv1d
     sensor_t = torch.tensor(sensor.T, dtype=torch.float32)  # (26, 25)
-    audio_t  = torch.tensor(audio.T,  dtype=torch.float32)  # (18, 25)
+    audio_t = torch.tensor(audio.T, dtype=torch.float32)    # (18, 25)
 
     return sensor_t, audio_t
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Aggregate chunk-level predictions → one prediction per sample
+#  Aggregation: chunk-level → run-level predictions
 # ═══════════════════════════════════════════════════════════════════
 
 def aggregate_predictions(chunk_probs, method="mean"):
     """
-    Aggregate (n_chunks, n_classes) probs into a single (n_classes,) vector.
-
-    Methods:
-      - "mean": average class probabilities
-      - "max_confidence": pick the chunk with highest max-class probability
-      - "majority_vote": hard-vote on predicted class, then average probs of winners
+    Aggregate (n_chunks, n_classes) probs → single (n_classes,) vector.
     """
     if len(chunk_probs) == 1:
         return chunk_probs[0]
@@ -301,200 +269,438 @@ def aggregate_predictions(chunk_probs, method="mean"):
 
     if method == "mean":
         return arr.mean(axis=0)
-
     elif method == "max_confidence":
-        max_confs = arr.max(axis=1)
-        best_chunk = max_confs.argmax()
-        return arr[best_chunk]
-
+        best = arr.max(axis=1).argmax()
+        return arr[best]
     elif method == "majority_vote":
-        preds = arr.argmax(axis=1)
         from collections import Counter
+        preds = arr.argmax(axis=1)
         vote = Counter(preds).most_common(1)[0][0]
-        mask = preds == vote
-        return arr[mask].mean(axis=0)
-
+        return arr[preds == vote].mean(axis=0)
     else:
         return arr.mean(axis=0)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Confusion matrix plot
+# ═══════════════════════════════════════════════════════════════════
+
+def save_confusion_matrix(cm, labels, title, save_path):
+    """Save a confusion matrix as PNG."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log.warning("matplotlib not installed — skipping plot")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    ax.set_title(title, fontsize=14)
+    fig.colorbar(im, ax=ax)
+
+    tick_marks = np.arange(len(labels))
+    ax.set_xticks(tick_marks)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticks(tick_marks)
+    ax.set_yticklabels(labels)
+
+    thresh = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], "d"),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+
+    ax.set_ylabel("True label")
+    ax.set_xlabel("Predicted label")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  Main inference pipeline
 # ═══════════════════════════════════════════════════════════════════
 
-def run(config_path="config.yaml"):
-    cfg  = load_config(config_path)
+def _load_model_and_device(cfg):
+    """Load checkpoint, build model, return (model, device, temperature, ckpt)."""
     tcfg = cfg.get("training", {})
-    icfg = cfg.get("inference", {})
-
-    test_root     = icfg.get("test_data_root", "test_data")
-    agg_method    = icfg.get("aggregation_method", "mean")
-    bin_threshold = icfg.get("binary_threshold", 0.5)
-    submit_path   = icfg.get("submission_path", os.path.join(cfg["output_root"], "submission.csv"))
-
-    # Resolve test root (could be relative to data_root or absolute)
-    if not os.path.isabs(test_root):
-        test_root = os.path.join(cfg.get("data_root", "."), test_root)
-
-    ckpt_dir  = tcfg.get("checkpoint_dir", os.path.join(cfg["output_root"], "checkpoints"))
+    ckpt_dir = tcfg.get("checkpoint_dir",
+                         os.path.join(cfg["output_root"], "checkpoints"))
     ckpt_path = os.path.join(ckpt_dir, "best_model.pt")
 
-    # ── 1. Check paths ──────────────────────────────────────────────
-    if not os.path.exists(test_root):
-        print(f"  ❌ Test data directory not found: {test_root}")
-        print(f"  Place the 'test_data/' folder with sample_0001..sample_0090 there.")
-        return
-
     if not os.path.exists(ckpt_path):
-        print(f"  ❌ Checkpoint not found: {ckpt_path}")
-        print(f"  Run step11_train first.")
-        return
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    # ── 2. Load model ───────────────────────────────────────────────
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    use_video   = ckpt.get("use_video", False)
+    use_video = ckpt.get("use_video", False)
+    use_sensor = ckpt.get("use_sensor", True)
     temperature = ckpt.get("temperature", 1.0)
 
-    model = build_model(cfg, use_video=use_video)
+    # This codebase's WeldFusionNet expects sensor+audio (+ optional video).
+    model = build_model(cfg, use_video=use_video, use_sensor=use_sensor)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    # Device (validate CUDA actually works; some wheels don't support newer GPUs)
-    device = torch.device("cpu")
     if torch.cuda.is_available():
-        try:
-            x = torch.tensor([1.0], device="cuda")
-            _ = x * 2.0
-            torch.cuda.synchronize()
-            device = torch.device("cuda")
-        except Exception as e:
-            msg = str(e).strip().splitlines()[0] if str(e).strip() else "unknown CUDA error"
-            print(f"  ⚠ CUDA detected but unusable ({type(e).__name__}: {msg}). Falling back to CPU.")
-            device = torch.device("cpu")
+        device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     model = model.to(device)
 
-    print(f"  Model loaded (epoch {ckpt['epoch']}, T={temperature:.4f}, device={device})")
+    modalities = []
+    if use_sensor:
+        modalities.append("sensor")
+    modalities.append("audio")
+    if use_video:
+        modalities.append("video")
+    print(f"  Model: epoch {ckpt['epoch']}, T={temperature:.4f}, "
+          f"modalities={'+'.join(modalities)}, device={device}")
+    return model, device, temperature, ckpt
 
-    # ── 3. Load norm stats ──────────────────────────────────────────
-    norm_path = os.path.join(cfg["output_root"], "dataset", "norm_stats.json")
-    if not os.path.exists(norm_path):
-        print(f"  ❌ Norm stats not found: {norm_path}")
-        print(f"  Run step8/step11 first.")
+
+def _evaluate_and_save(results, out_dir, label_map, temperature, has_labels):
+    """Write predictions CSV, compute metrics, save plots."""
+
+    # ── Write predictions CSV ───────────────────────────────────────
+    pred_path = os.path.join(out_dir, "predictions.csv")
+    with open(pred_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["run_id", "true_code", "pred_code", "p_defect", "n_chunks"]
+        header += [f"prob_c{IDX_TO_CODE[i]:02d}" for i in range(NUM_CLASSES)]
+        writer.writerow(header)
+        for r in results:
+            row = [r["run_id"],
+                   f"{r['true_code']:02d}" if r["true_code"] is not None else "",
+                   f"{r['pred_code']:02d}", r["p_defect"], r["n_chunks"]]
+            row += [round(p, 4) for p in r["probs"]]
+            writer.writerow(row)
+    print(f"\n  Predictions saved: {pred_path}")
+
+    # ── Evaluate (if labels available) ──────────────────────────────
+    if has_labels and all(r["true_code"] is not None for r in results):
+        true_codes = np.array([r["true_code"] for r in results])
+        pred_codes = np.array([r["pred_code"] for r in results])
+
+        true_idx = np.array([CODE_TO_IDX.get(c, -1) for c in true_codes])
+        pred_idx_arr = np.array([r["pred_idx"] for r in results])
+
+        valid = true_idx >= 0
+        true_idx_v = true_idx[valid]
+        pred_idx_v = pred_idx_arr[valid]
+
+        present = sorted(set(true_idx_v.tolist()) | set(pred_idx_v.tolist()))
+
+        if len(true_idx_v) > 0:
+            accuracy = float((true_codes[valid] == pred_codes[valid]).mean())
+
+            true_bin = (true_codes[valid] != 0).astype(int)
+            pred_bin = (pred_codes[valid] != 0).astype(int)
+            bin_f1 = f1_score(true_bin, pred_bin, average="binary", zero_division=0)
+
+            macro_f1 = f1_score(true_idx_v, pred_idx_v,
+                                labels=present, average="macro", zero_division=0)
+
+            final_score = 0.6 * bin_f1 + 0.4 * macro_f1
+
+            p_defect_arr = np.array([r["p_defect"] for r in results])[valid]
+            ece = expected_calibration_error(p_defect_arr, true_bin, n_bins=15)
+
+            class_names = [f"code_{IDX_TO_CODE[i]:02d}" for i in present]
+            report_txt = classification_report(
+                true_idx_v, pred_idx_v,
+                labels=present, target_names=class_names, zero_division=0,
+            )
+
+            n_runs = len(results)
+            print(f"\n{'=' * 55}")
+            print(f"  INFERENCE EVALUATION ({n_runs} runs)")
+            print(f"{'=' * 55}")
+            print(f"  Run-level accuracy : {accuracy:.4f}")
+            print(f"  Binary F1          : {bin_f1:.4f}")
+            print(f"  Macro F1           : {macro_f1:.4f}")
+            print(f"  Final Score        : {final_score:.4f}")
+            print(f"  ECE                : {ece:.4f}")
+            print(f"  Temperature        : {temperature:.4f}")
+            print(f"{'=' * 55}")
+            print(f"\n{report_txt}")
+
+            cm = confusion_matrix(true_idx_v, pred_idx_v, labels=present)
+            save_confusion_matrix(
+                cm, class_names,
+                f"Test Inference — Confusion Matrix ({n_runs} runs)",
+                os.path.join(out_dir, "confusion_matrix.png"),
+            )
+
+            metrics = {
+                "n_runs": n_runs,
+                "accuracy": round(accuracy, 4),
+                "binary_f1": round(bin_f1, 4),
+                "macro_f1": round(macro_f1, 4),
+                "final_score": round(final_score, 4),
+                "ece": round(ece, 4),
+                "temperature": round(temperature, 6),
+                "per_class_f1": {},
+            }
+            per_f1 = f1_score(true_idx_v, pred_idx_v, labels=present,
+                              average=None, zero_division=0)
+            for i, lab in enumerate(present):
+                metrics["per_class_f1"][f"code_{IDX_TO_CODE[lab]:02d}"] = round(float(per_f1[i]), 4)
+
+            metrics_path = os.path.join(out_dir, "metrics.json")
+            with open(metrics_path, "w") as f:
+                json.dump(metrics, f, indent=2)
+            print(f"  Metrics: {metrics_path}")
+
+    # ── Prediction distribution ─────────────────────────────────────
+    from collections import Counter
+    code_counts = Counter(r["pred_code"] for r in results)
+    print(f"\n  Prediction distribution:")
+    for code in sorted(code_counts):
+        name = label_map.get(f"{code:02d}", f"code_{code:02d}")
+        print(f"    code {code:02d} ({name}): {code_counts[code]}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  MODE 1: Holdout test split (from split_dict.json — recommended)
+# ─────────────────────────────────────────────────────────────────────
+
+def run_from_split(config_path="config.yaml"):
+    """
+    Evaluate the model on the holdout TEST split produced by step6.
+
+    This uses the same pre-computed .npz chunks as training, but only
+    those whose run_id is in the "test" list of split_dict.json.
+    No raw-data preprocessing needed — identical feature pipeline.
+    """
+    cfg = load_config(config_path)
+    label_map = cfg.get("label_map", {})
+    icfg = cfg.get("inference", {})
+    agg_method = icfg.get("aggregation_method", "mean")
+
+    out_dir = os.path.join(cfg["output_root"], "inference")
+    ensure_dir(out_dir)
+
+    # ── Load model ──────────────────────────────────────────────────
+    model, device, temperature, ckpt = _load_model_and_device(cfg)
+    use_video = ckpt.get("use_video", False)
+    use_sensor = ckpt.get("use_sensor", True)
+
+    # ── Build test DataLoader from manifest ─────────────────────────
+    test_loader, norm_stats = build_test_loader(cfg, load_video=use_video, use_sensor=use_sensor)
+    if test_loader is None:
+        # This repo's step6 generates train/val only. Fall back to val so step14
+        # remains usable for evaluation and sanity-check inference.
+        print("  ⚠ No 'test' split in manifest — falling back to 'val' split")
+        _train_loader, test_loader, _norm_stats, _class_weights = build_dataloaders(
+            cfg, load_video=use_video, use_sensor=use_sensor,
+        )
+
+    # ── Run inference per chunk, then aggregate per run ─────────────
+    from pipeline.step11_train import remap_labels
+
+    run_chunks = {}   # run_id → list of (probs, true_code)
+
+    print(f"\n  Running chunk-level inference...")
+    with torch.no_grad():
+        for batch in test_loader:
+            sensor = batch["sensor"].to(device) if use_sensor else None
+            audio  = batch["audio"].to(device)
+            video  = batch["video"].to(device) if use_video else None
+            labels_orig = batch["label"]        # original codes
+            run_ids = batch["run_id"]
+
+            logits_mc, logit_bin = model(sensor, audio, video)
+            scaled = logits_mc / temperature
+            probs = torch.softmax(scaled, dim=1).cpu().numpy()
+
+            for i, rid in enumerate(run_ids):
+                true_code = int(labels_orig[i])
+                if rid not in run_chunks:
+                    run_chunks[rid] = {"probs": [], "true_code": true_code}
+                run_chunks[rid]["probs"].append(probs[i])
+
+    # ── Aggregate chunk→run ─────────────────────────────────────────
+    results = []
+    has_labels = True
+
+    for si, (run_id, info) in enumerate(sorted(run_chunks.items())):
+        agg_probs = aggregate_predictions(info["probs"], agg_method)
+        pred_idx = int(agg_probs.argmax())
+        pred_code = IDX_TO_CODE[pred_idx]
+        true_code = info["true_code"]
+        p_defect = 1.0 - float(agg_probs[0])
+
+        result = {
+            "run_id": run_id,
+            "true_code": true_code,
+            "pred_code": pred_code,
+            "pred_idx": pred_idx,
+            "p_defect": round(p_defect, 4),
+            "n_chunks": len(info["probs"]),
+            "n_sensor_features": 0,
+            "probs": agg_probs.tolist(),
+        }
+        results.append(result)
+
+        correct = "✓" if true_code == pred_code else "✗"
+        print(f"  [{si+1:>3}/{len(run_chunks)}] {run_id}  "
+              f"true={true_code:02d}  pred={pred_code:02d}  "
+              f"p_defect={p_defect:.3f}  chunks={len(info['probs']):>3}  {correct}")
+
+    # ── Evaluate & save ─────────────────────────────────────────────
+    _evaluate_and_save(results, out_dir, label_map, temperature, has_labels)
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  MODE 2: External test directory (raw run folders — legacy)
+# ─────────────────────────────────────────────────────────────────────
+
+def run_from_dir(config_path="config.yaml", test_dir=None):
+    """
+    Process raw run directories from scratch (step2→step3→step6 inline)
+    and evaluate.  Use when the test data is external (e.g. sampleData).
+    """
+    cfg = load_config(config_path)
+    label_map = cfg.get("label_map", {})
+    icfg = cfg.get("inference", {})
+    agg_method = icfg.get("aggregation_method", "mean")
+
+    # ── Resolve test directory ──────────────────────────────────────
+    if test_dir is None:
+        test_dir = icfg.get("test_data_root", "")
+        if not os.path.isabs(test_dir):
+            test_dir = os.path.join(cfg.get("data_root", "."), test_dir)
+
+    if not os.path.isdir(test_dir):
+        print(f"  ❌ Test directory not found: {test_dir}")
         return
+
+    out_dir = os.path.join(cfg["output_root"], "inference")
+    ensure_dir(out_dir)
+
+    # ── Load model ──────────────────────────────────────────────────
+    model, device, temperature, ckpt = _load_model_and_device(cfg)
+
+    # ── Load norm stats ─────────────────────────────────────────────
+    norm_path = os.path.join(cfg["output_root"], "dataset", "norm_stats.json")
     with open(norm_path) as f:
         norm_stats = json.load(f)
 
-    # ── 4. Discover test samples ────────────────────────────────────
-    sample_dirs = sorted([
-        d for d in os.listdir(test_root)
-        if os.path.isdir(os.path.join(test_root, d))
-        and d.startswith("sample_")
-    ])
-    print(f"  Found {len(sample_dirs)} test samples")
+    use_video = ckpt.get("use_video", False)
 
-    if len(sample_dirs) == 0:
-        print("  ❌ No sample_XXXX folders found!")
+    # ── Discover run directories ────────────────────────────────────
+    run_dirs = sorted([
+        d for d in os.listdir(test_dir)
+        if os.path.isdir(os.path.join(test_dir, d))
+    ])
+    print(f"  Found {len(run_dirs)} test runs in {test_dir}\n")
+
+    if not run_dirs:
+        print("  ❌ No run directories found!")
         return
 
-    # ── 5. Predict each sample ──────────────────────────────────────
+    # ── Process each run ────────────────────────────────────────────
     results = []
+    has_labels = True
 
-    for si, sample_id in enumerate(sample_dirs):
-        sample_path = os.path.join(test_root, sample_id)
+    for si, run_id in enumerate(run_dirs):
+        run_path = os.path.join(test_dir, run_id)
 
         try:
-            # Preprocess
-            chunks = preprocess_test_sample(sample_path, cfg)
+            true_code = int(run_id.split("-")[-1])
+        except (ValueError, IndexError):
+            true_code = None
+            has_labels = False
 
-            # Predict each chunk
+        try:
+            chunks, sensor_cols = preprocess_run(run_path, run_id, cfg)
+
             chunk_probs = []
             with torch.no_grad():
                 for ch in chunks:
                     sensor_t, audio_t = normalize_chunk(ch, norm_stats)
-                    sensor_t = sensor_t.unsqueeze(0).to(device)
-                    audio_t  = audio_t.unsqueeze(0).to(device)
-                    video_t  = None  # video not used unless use_video
+                    sensor_in = sensor_t.unsqueeze(0).to(device)
+                    audio_in = audio_t.unsqueeze(0).to(device)
 
-                    logits_mc, logit_bin = model(sensor_t, audio_t, video_t)
-
-                    # Apply temperature scaling
+                    logits_mc, logit_bin = model(sensor_in, audio_in, None)
                     scaled = logits_mc / temperature
                     probs = torch.softmax(scaled, dim=1).cpu().numpy()[0]
                     chunk_probs.append(probs)
 
-            # Aggregate
             agg_probs = aggregate_predictions(chunk_probs, agg_method)
-
-            # Derive predictions
-            pred_idx  = int(agg_probs.argmax())
+            pred_idx = int(agg_probs.argmax())
             pred_code = IDX_TO_CODE[pred_idx]
-            p_defect  = 1.0 - float(agg_probs[0])  # idx 0 → code 00 (good weld)
+            p_defect = 1.0 - float(agg_probs[0])
 
-            results.append({
-                "sample_id":       sample_id,
-                "pred_label_code": f"{pred_code:02d}",
-                "p_defect":        round(p_defect, 4),
-                "n_chunks":        len(chunks),
-            })
+            result = {
+                "run_id": run_id,
+                "true_code": true_code,
+                "pred_code": pred_code,
+                "pred_idx": pred_idx,
+                "p_defect": round(p_defect, 4),
+                "n_chunks": len(chunks),
+                "n_sensor_features": len(sensor_cols) if sensor_cols else 0,
+                "probs": agg_probs.tolist(),
+            }
+            results.append(result)
 
-            if (si + 1) % 10 == 0 or si == 0 or (si + 1) == len(sample_dirs):
-                print(f"  [{si+1}/{len(sample_dirs)}] {sample_id} → "
-                      f"code={pred_code:02d}  p_defect={p_defect:.3f}  "
-                      f"chunks={len(chunks)}")
+            correct = "✓" if true_code == pred_code else "✗"
+            fmt_true = f"{true_code:02d}" if true_code is not None else "??"
+            print(f"  [{si+1:>3}/{len(run_dirs)}] {run_id}  "
+                  f"true={fmt_true}  pred={pred_code:02d}  "
+                  f"p_defect={p_defect:.3f}  chunks={len(chunks):>3}  {correct}")
 
         except Exception as e:
-            log.error("Failed on %s: %s", sample_id, e)
-            print(f"  ⚠ {sample_id}: ERROR — {e}")
-            # Write a safe default (good weld, low confidence)
+            log.error("Failed on %s: %s", run_id, e, exc_info=True)
+            print(f"  ⚠ [{si+1:>3}/{len(run_dirs)}] {run_id}: ERROR — {e}")
             results.append({
-                "sample_id":       sample_id,
-                "pred_label_code": "00",
-                "p_defect":        0.50,
-                "n_chunks":        0,
+                "run_id": run_id,
+                "true_code": true_code,
+                "pred_code": 0,
+                "pred_idx": 0,
+                "p_defect": 0.50,
+                "n_chunks": 0,
+                "n_sensor_features": 0,
+                "probs": [0.0] * NUM_CLASSES,
             })
 
-    # ── 6. Write submission CSV ─────────────────────────────────────
-    ensure_dir(os.path.dirname(submit_path) or ".")
-
-    with open(submit_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["sample_id", "pred_label_code", "p_defect"])
-        for r in sorted(results, key=lambda x: x["sample_id"]):
-            writer.writerow([
-                r["sample_id"],
-                r["pred_label_code"],
-                r["p_defect"],
-            ])
-
-    print(f"\n{'=' * 50}")
-    print(f"  SUBMISSION WRITTEN")
-    print(f"{'=' * 50}")
-    print(f"  File: {submit_path}")
-    print(f"  Samples: {len(results)}")
-
-    # Quick stats
-    n_defect = sum(1 for r in results if r["pred_label_code"] != "00")
-    print(f"  Predicted defect: {n_defect} / {len(results)}")
-    print(f"  Predicted good:   {len(results) - n_defect} / {len(results)}")
-
-    # Code distribution
-    from collections import Counter
-    code_counts = Counter(r["pred_label_code"] for r in results)
-    for code in sorted(code_counts):
-        print(f"    code {code}: {code_counts[code]}")
-    print(f"{'=' * 50}")
-
+    # ── Evaluate & save ─────────────────────────────────────────────
+    _evaluate_and_save(results, out_dir, label_map, temperature, has_labels)
     return results
+
+
+# ── Unified entry point ─────────────────────────────────────────────
+
+def run(config_path="config.yaml", test_dir=None):
+    """
+    Main entry point.  Dispatches to the appropriate mode:
+      - If test_dir is provided → MODE 2 (external directory)
+      - Otherwise              → MODE 1 (holdout split from split_dict.json)
+    """
+    if test_dir is not None:
+        print("  [MODE 2] External test directory")
+        return run_from_dir(config_path, test_dir)
+    else:
+        print("  [MODE 1] Holdout test split from split_dict.json")
+        return run_from_split(config_path)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Step 14: Test-set inference")
+    parser = argparse.ArgumentParser(description="Step 14: Test-set inference & evaluation")
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--test-dir", default=None,
+                        help="Path to external test run directories. "
+                             "If omitted, uses the holdout 'test' split "
+                             "from split_dict.json (recommended).")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
-    run(args.config)
+    run(args.config, test_dir=args.test_dir)

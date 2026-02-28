@@ -118,9 +118,10 @@ def run(config_path="config.yaml"):
     # ── 1. Load model ───────────────────────────────────────────────
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     use_video = ckpt.get("use_video", False)
+    use_sensor = ckpt.get("use_sensor", True)
     temperature = ckpt.get("temperature", 1.0)
 
-    model = build_model(cfg, use_video=use_video)
+    model = build_model(cfg, use_video=use_video, use_sensor=use_sensor)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
@@ -144,7 +145,7 @@ def run(config_path="config.yaml"):
 
     # ── 2. Collect predictions ──────────────────────────────────────
     print("  Running inference on validation set...")
-    _, val_loader, _, _ = build_dataloaders(cfg, load_video=use_video)
+    _, val_loader, _, _ = build_dataloaders(cfg, load_video=use_video, use_sensor=use_sensor)
 
     all_logits = []
     all_logits_bin = []
@@ -154,7 +155,7 @@ def run(config_path="config.yaml"):
 
     with torch.no_grad():
         for batch in val_loader:
-            sensor = batch["sensor"].to(device)
+            sensor = batch["sensor"].to(device) if use_sensor else None
             audio = batch["audio"].to(device)
             video = batch["video"].to(device) if use_video else None
 

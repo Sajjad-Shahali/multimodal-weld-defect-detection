@@ -46,6 +46,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+import sys
 
 from pipeline.utils import load_config, ensure_dir
 
@@ -63,7 +64,7 @@ MOBILENET_SIZE = 224
 
 # ── Normalization stats ─────────────────────────────────────────────
 
-def compute_norm_stats(manifest, chunk_dir, max_samples=2000, seed=42):
+def compute_norm_stats(manifest, chunk_dir, max_samples=2000, seed=42, *, use_sensor=True):
     """
     Compute per-feature mean and std for sensor and audio arrays
     from a random sample of TRAIN-split chunks.
@@ -80,16 +81,18 @@ def compute_norm_stats(manifest, chunk_dir, max_samples=2000, seed=42):
     sensor_accum, audio_accum = [], []
     for fname in train_files:
         d = np.load(os.path.join(chunk_dir, fname), allow_pickle=True)
-        sensor_accum.append(d["sensor"])   # (25, 26)
+        if use_sensor:
+            sensor_accum.append(d["sensor"])   # (25, 26)
         audio_accum.append(d["audio"])     # (25, 18)
 
     # Stack → (N*25, features)
-    sensor_all = np.concatenate(sensor_accum, axis=0)
+    if use_sensor:
+        sensor_all = np.concatenate(sensor_accum, axis=0)
     audio_all = np.concatenate(audio_accum, axis=0)
 
     stats = {
-        "sensor_mean": sensor_all.mean(axis=0).tolist(),
-        "sensor_std":  (sensor_all.std(axis=0) + 1e-8).tolist(),
+        "sensor_mean": (sensor_all.mean(axis=0).tolist() if use_sensor else [0.0] * 26),
+        "sensor_std":  ((sensor_all.std(axis=0) + 1e-8).tolist() if use_sensor else [1.0] * 26),
         "audio_mean":  audio_all.mean(axis=0).tolist(),
         "audio_std":   (audio_all.std(axis=0) + 1e-8).tolist(),
     }
@@ -151,7 +154,7 @@ class WeldChunkDataset(Dataset):
     """
 
     def __init__(self, manifest, chunk_dir, norm_stats, cfg,
-                 load_video=False, video_n_frames=5, augment=False):
+                 load_video=False, video_n_frames=5, augment=False, load_sensor=True):
         self.files = manifest["file"].values
         self.labels = manifest["label_code"].values.astype(int)
         self.run_ids = manifest["run_id"].values.astype(str)
@@ -159,10 +162,13 @@ class WeldChunkDataset(Dataset):
         self.chunk_dir = chunk_dir
         self.load_video = load_video
         self.augment = augment
+        self.load_sensor = load_sensor
 
         # Normalization tensors
-        self.sensor_mean = torch.tensor(norm_stats["sensor_mean"], dtype=torch.float32)
-        self.sensor_std = torch.tensor(norm_stats["sensor_std"], dtype=torch.float32)
+        sensor_mean = norm_stats.get("sensor_mean", [0.0] * 26)
+        sensor_std = norm_stats.get("sensor_std", [1.0] * 26)
+        self.sensor_mean = torch.tensor(sensor_mean, dtype=torch.float32)
+        self.sensor_std = torch.tensor(sensor_std, dtype=torch.float32)
         self.audio_mean = torch.tensor(norm_stats["audio_mean"], dtype=torch.float32)
         self.audio_std = torch.tensor(norm_stats["audio_std"], dtype=torch.float32)
 
@@ -185,17 +191,22 @@ class WeldChunkDataset(Dataset):
         path = os.path.join(self.chunk_dir, self.files[idx])
         data = np.load(path, allow_pickle=True)
 
-        sensor = torch.tensor(data["sensor"], dtype=torch.float32)   # (25, 26)
+        if self.load_sensor:
+            sensor = torch.tensor(data["sensor"], dtype=torch.float32)   # (25, 26)
+        else:
+            sensor = torch.zeros((25, 26), dtype=torch.float32)
         audio = torch.tensor(data["audio"], dtype=torch.float32)     # (25, 18)
         label = int(data["label"])
 
         # ── Normalize sensor & audio ──
-        sensor = (sensor - self.sensor_mean) / self.sensor_std
+        if self.load_sensor:
+            sensor = (sensor - self.sensor_mean) / self.sensor_std
         audio = (audio - self.audio_mean) / self.audio_std
 
         # ── Augmentation (train only) ──
         if self.augment:
-            sensor = sensor + torch.randn_like(sensor) * 0.01
+            if self.load_sensor:
+                sensor = sensor + torch.randn_like(sensor) * 0.01
             audio = audio + torch.randn_like(audio) * 0.01
 
         # ── Transpose to channels-first for Conv1d: (features, timesteps) ──
@@ -238,7 +249,7 @@ class WeldChunkDataset(Dataset):
 # minority classes and wreck gradients.
 
 
-def build_dataloaders(cfg, load_video=False):
+def build_dataloaders(cfg, load_video=False, *, use_sensor=True):
     """
     Build train & val DataLoaders from the step6 output.
 
@@ -264,10 +275,14 @@ def build_dataloaders(cfg, load_video=False):
         print(f"  Loaded normalization stats from {stats_path}")
     else:
         print("  Computing normalization stats from train split...")
-        norm_stats = compute_norm_stats(manifest, chunk_dir)
+        norm_stats = compute_norm_stats(manifest, chunk_dir, use_sensor=use_sensor)
         with open(stats_path, "w") as f:
             json.dump(norm_stats, f, indent=2)
         print(f"  Saved normalization stats to {stats_path}")
+
+    # Ensure required keys exist (for backwards compat if stats were written by older code)
+    norm_stats.setdefault("sensor_mean", [0.0] * 26)
+    norm_stats.setdefault("sensor_std", [1.0] * 26)
 
     # Split manifests
     train_mf = manifest[manifest["split"] == "train"].reset_index(drop=True)
@@ -276,6 +291,11 @@ def build_dataloaders(cfg, load_video=False):
     tcfg = cfg.get("training", {})
     video_n_frames = tcfg.get("video_frames", 5)
     batch_size = tcfg.get("batch_size", 16)
+    # Windows can hang with DataLoader workers depending on env / OpenCV.
+    # Default to 0 workers on Windows unless overridden in config.
+    default_workers = 0 if sys.platform.startswith("win") else 2
+    num_workers = int(tcfg.get("num_workers", default_workers))
+    pin_memory = bool(tcfg.get("pin_memory", True))
 
     # Datasets
     train_ds = WeldChunkDataset(
@@ -283,22 +303,24 @@ def build_dataloaders(cfg, load_video=False):
         load_video=load_video,
         video_n_frames=video_n_frames,
         augment=True,
+        load_sensor=use_sensor,
     )
     val_ds = WeldChunkDataset(
         val_mf, chunk_dir, norm_stats, cfg,
         load_video=load_video,
         video_n_frames=video_n_frames,
         augment=False,
+        load_sensor=use_sensor,
     )
 
     # Plain shuffle — NO WeightedRandomSampler (imbalance handled in loss)
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=True, drop_last=True,
+        num_workers=num_workers, pin_memory=pin_memory, drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
+        num_workers=num_workers, pin_memory=pin_memory,
     )
 
     # ── Class weights for FocalLoss (single source of imbalance fix) ──
@@ -321,8 +343,77 @@ def build_dataloaders(cfg, load_video=False):
 
     print(f"  Train: {len(train_ds)} chunks  |  Val: {len(val_ds)} chunks")
     print(f"  Batch size: {batch_size}  |  Video: {'ON' if load_video else 'OFF'}")
+    print(f"  DataLoader: num_workers={num_workers}, pin_memory={pin_memory}")
 
     return train_loader, val_loader, norm_stats, class_weights
+
+
+def build_test_loader(cfg, load_video=False, *, use_sensor=True):
+    """
+    Build a DataLoader for the holdout TEST split produced by step6.
+
+    Returns
+    -------
+    test_loader, norm_stats
+
+    If no test split exists, returns (None, norm_stats).
+    """
+    out_root = cfg["output_root"]
+    ds_dir = os.path.join(out_root, "dataset")
+    chunk_dir = os.path.join(ds_dir, "chunks")
+
+    manifest_path = os.path.join(ds_dir, "manifest.csv")
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"manifest.csv not found: {manifest_path}")
+
+    manifest = pd.read_csv(manifest_path)
+    if "split" not in manifest.columns:
+        raise ValueError("manifest.csv is missing required 'split' column")
+
+    # Load (or compute) normalization stats
+    stats_path = os.path.join(ds_dir, "norm_stats.json")
+    if os.path.exists(stats_path):
+        with open(stats_path) as f:
+            norm_stats = json.load(f)
+    else:
+        # Fallback: compute from train split
+        norm_stats = compute_norm_stats(manifest, chunk_dir, use_sensor=use_sensor)
+        ensure_dir(ds_dir)
+        with open(stats_path, "w") as f:
+            json.dump(norm_stats, f, indent=2)
+
+    norm_stats.setdefault("sensor_mean", [0.0] * 26)
+    norm_stats.setdefault("sensor_std", [1.0] * 26)
+
+    test_mf = manifest[manifest["split"] == "test"].reset_index(drop=True)
+    if len(test_mf) == 0:
+        return None, norm_stats
+
+    tcfg = cfg.get("training", {})
+    video_n_frames = tcfg.get("video_frames", 5)
+    batch_size = int(tcfg.get("batch_size", 16))
+    default_workers = 0 if sys.platform.startswith("win") else 2
+    num_workers = int(tcfg.get("num_workers", default_workers))
+    pin_memory = bool(tcfg.get("pin_memory", True))
+
+    test_ds = WeldChunkDataset(
+        test_mf, chunk_dir, norm_stats, cfg,
+        load_video=load_video,
+        video_n_frames=video_n_frames,
+        augment=False,
+        load_sensor=use_sensor,
+    )
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+
+    return test_loader, norm_stats
 
 
 # ── CLI: quick sanity check ─────────────────────────────────────────

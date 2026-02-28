@@ -24,6 +24,9 @@ Usage:
     # Just inference on test set
     python -m pipeline.run_all --steps 14
 
+    # Step 14 on an external directory (MODE 2)
+    python -m pipeline.run_all --steps 14 --test-dir sampleData/08-17-22-0011-00
+
     # Custom config
     python -m pipeline.run_all --config my.yaml --steps 11
 
@@ -69,6 +72,7 @@ from pipeline import step11_train
 from pipeline import step12_calibrate
 from pipeline import step13_evaluate
 from pipeline import step14_inference
+from pipeline import step15_sanity_leakage
 
 
 # ── Step registry ───────────────────────────────────────────────────
@@ -86,13 +90,16 @@ STEPS = {
 
     # Phase 2 — Training
     7:  ("Step 7:  LightGBM tabular baseline",    step7_tabular_baseline),
-    # 8 & 9 & 10 are library modules (Dataset, Model, Loss) — no standalone run
+    # 8 & 9 & 10 2
     11: ("Step 11: WeldFusionNet training",       step11_train),
 
     # Phase 3 — Calibration, Evaluation, Inference
     12: ("Step 12: Confidence calibration",       step12_calibrate),
     13: ("Step 13: Full evaluation",              step13_evaluate),
     14: ("Step 14: Test-set inference",           step14_inference),
+
+    # Sanity
+    15: ("Step 15: Leakage sanity checks",        step15_sanity_leakage),
 }
 
 DEFAULT_STEPS = [1, 2, 3, 4, 5, 6]
@@ -109,6 +116,8 @@ def main():
                         help="Path to config.yaml")
     parser.add_argument("--use-video", action="store_true", default=False,
                         help="Enable video branch in step11 training")
+    parser.add_argument("--test-dir", type=str, default=None,
+                        help="(Step 14 only) External test directory to run inference on")
     parser.add_argument("--verbose", action="store_true", default=False,
                         help="Enable verbose (INFO-level) logging")
     parser.add_argument(
@@ -128,9 +137,12 @@ def main():
     else:
         log_level = logging.WARNING
 
+    # Use force=True so reruns and libraries that configured logging earlier
+    # don't prevent our CLI flags from taking effect.
     logging.basicConfig(
         level=log_level,
         format="%(levelname)s [%(name)s]: %(message)s",
+        force=True,
     )
 
     print("=" * 60)
@@ -157,6 +169,9 @@ def main():
         # step11 takes an extra use_video kwarg
         if step_num == 11:
             module.run(config_path=args.config, use_video=args.use_video)
+        # step14 optionally takes a test_dir to trigger MODE 2
+        elif step_num == 14:
+            module.run(config_path=args.config, test_dir=args.test_dir)
         else:
             module.run(config_path=args.config)
 

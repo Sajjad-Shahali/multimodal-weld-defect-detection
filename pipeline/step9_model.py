@@ -276,6 +276,7 @@ class WeldFusionNet(nn.Module):
     def __init__(
         self,
         num_classes=NUM_CLASSES,
+        use_sensor=True,
         use_video=False,
         video_backbone="mobilenet_v3_small",
         fusion_type="concat",
@@ -283,14 +284,15 @@ class WeldFusionNet(nn.Module):
         transformer_heads=4,
     ):
         super().__init__()
+        self.use_sensor = use_sensor
         self.use_video = use_video
         self.fusion_type = fusion_type
 
         # ── Modality encoders ──
-        self.sensor_encoder = Conv1dEncoder(in_channels=26, embed_dim=64)
+        self.sensor_encoder = Conv1dEncoder(in_channels=26, embed_dim=64) if use_sensor else None
         self.audio_encoder = Conv1dEncoder(in_channels=18, embed_dim=64)
 
-        sensor_dim = 64
+        sensor_dim = 64 if use_sensor else 0
         audio_dim = 64
         video_dim = 128
 
@@ -299,10 +301,10 @@ class WeldFusionNet(nn.Module):
                 self.video_encoder = TinyCNNVideoEncoder(embed_dim=video_dim)
             else:
                 self.video_encoder = MobileNetVideoEncoder(embed_dim=video_dim)
-            total_dim = sensor_dim + audio_dim + video_dim   # 256
+            total_dim = sensor_dim + audio_dim + video_dim
         else:
             self.video_encoder = None
-            total_dim = sensor_dim + audio_dim               # 128
+            total_dim = sensor_dim + audio_dim
 
         # ── Fusion ──
         fusion_out = 128
@@ -310,7 +312,7 @@ class WeldFusionNet(nn.Module):
             # For transformer, all tokens must have the same dim.
             # Project everything to a common token_dim.
             token_dim = 128
-            self.sensor_proj = nn.Linear(sensor_dim, token_dim)
+            self.sensor_proj = nn.Linear(sensor_dim, token_dim) if use_sensor else None
             self.audio_proj = nn.Linear(audio_dim, token_dim)
             if use_video:
                 self.video_proj = nn.Linear(video_dim, token_dim)
@@ -342,7 +344,12 @@ class WeldFusionNet(nn.Module):
         logits_mc : (B, num_classes)  — raw logits for 7-class
         logit_bin : (B, 1)           — raw logit for binary
         """
-        s = self.sensor_encoder(sensor)          # (B, 64)
+        if self.use_sensor:
+            if sensor is None:
+                raise ValueError("sensor input is required when use_sensor=True")
+            s = self.sensor_encoder(sensor)          # (B, 64)
+        else:
+            s = None
         a = self.audio_encoder(audio)            # (B, 64)
 
         if self.use_video and video is not None:
@@ -352,18 +359,22 @@ class WeldFusionNet(nn.Module):
 
         # Fuse
         if self.fusion_type == "transformer":
-            s_proj = self.sensor_proj(s)
             a_proj = self.audio_proj(a)
+            tokens = []
+            if self.use_sensor and s is not None:
+                tokens.append(self.sensor_proj(s))
+            tokens.append(a_proj)
             if v is not None:
-                v_proj = self.video_proj(v)
-                fused = self.fusion(s_proj, a_proj, v_proj)
-            else:
-                fused = self.fusion(s_proj, a_proj)
+                tokens.append(self.video_proj(v))
+            fused = self.fusion(*tokens)
         else:
+            tokens = []
+            if self.use_sensor and s is not None:
+                tokens.append(s)
+            tokens.append(a)
             if v is not None:
-                fused = self.fusion(s, a, v)
-            else:
-                fused = self.fusion(s, a)
+                tokens.append(v)
+            fused = self.fusion(*tokens)
 
         logits_mc = self.head_multiclass(fused)  # (B, 7)
         logit_bin = self.head_binary(fused)      # (B, 1)
@@ -379,7 +390,7 @@ class WeldFusionNet(nn.Module):
 
 # ── Factory from config ─────────────────────────────────────────────
 
-def build_model(cfg, use_video=False):
+def build_model(cfg, use_video=False, use_sensor=True):
     """Create a WeldFusionNet from the config dict."""
     tcfg = cfg.get("training", {})
     t3 = cfg.get("tier3", {})
@@ -388,6 +399,7 @@ def build_model(cfg, use_video=False):
 
     model = WeldFusionNet(
         num_classes=NUM_CLASSES,
+        use_sensor=use_sensor,
         use_video=use_video,
         video_backbone=tcfg.get("video_backbone", "mobilenet_v3_small"),
         fusion_type=fusion_type,
@@ -396,7 +408,10 @@ def build_model(cfg, use_video=False):
     )
 
     total, trainable = model.count_parameters()
-    print(f"  Model: WeldFusionNet (fusion={fusion_type}, video={'ON' if use_video else 'OFF'})")
+    print(
+        f"  Model: WeldFusionNet (fusion={fusion_type}, "
+        f"sensor={'ON' if use_sensor else 'OFF'}, video={'ON' if use_video else 'OFF'})"
+    )
     print(f"  Parameters: {total:,} total, {trainable:,} trainable")
 
     return model

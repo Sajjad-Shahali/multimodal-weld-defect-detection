@@ -1,0 +1,58 @@
+     20   0.0107   0.0022   0.0307   0.0260   0.980   0.977   0.979    4.00e-09
+    Per-class F1: c0=0.98  c1=0.96  c2=0.93  c6=1.00  c7=0.97  c8=1.00  c11=1.00
+
+  ── Training Complete ──
+  Best FinalScore: 0.9837  (epoch 19)
+  Total time: 820.4s (13.7 min)
+  Saved: output/checkpoints/best_model.pt
+  Log:   output/checkpoints\training_log.json
+  ⏱ Step 11: WeldFusionNet training completed in 821.0s
+
+
+
+────────────────────────────────────────────────────────────
+  Step 13: Full evaluation
+────────────────────────────────────────────────────────────
+  Model: WeldFusionNet (fusion=concat, video=OFF)
+  Parameters: 162,312 total, 162,312 trainable
+  Model loaded (epoch 19, T=0.5527, device=cuda)
+  Running inference on validation set...
+  Loaded normalization stats from output\dataset\norm_stats.json
+  Train: 32953 chunks  |  Val: 5458 chunks
+  Batch size: 16  |  Video: OFF
+  DataLoader: num_workers=0, pin_memory=True
+  Val samples: 5458
+
+==================================================
+  EVALUATION RESULTS
+==================================================
+  Binary F1  : 0.9835
+  Macro F1   : 0.9830
+  Final score: 0.9833
+  ECE        : 0.0308
+  Temperature: 0.5527
+==================================================
+
+              precision    recall  f1-score   support
+
+     code_00       1.00      0.97      0.98      2688
+     code_01       0.97      0.98      0.97       987
+     code_02       0.90      0.99      0.94       588
+     code_06       1.00      1.00      1.00       125
+     code_07       0.98      1.00      0.99       514
+     code_08       1.00      1.00      1.00       290
+     code_11       1.00      1.00      1.00       266
+
+    accuracy                           0.98      5458
+   macro avg       0.98      0.99      0.98      5458
+weighted avg       0.98      0.98      0.98      5458
+
+  Per-class report: output\evaluation\per_class_report.csv
+  Val predictions: output\evaluation\val_predictions.csv
+  Metrics: output\evaluation\val_metrics.json
+  ⏱ Step 13: Full evaluation completed in 6.1s
+
+============================================================
+  PIPELINE COMPLETE
+============================================================
+(weld) PS D:\hachaton\multimodal-weld-defect-detection> 
