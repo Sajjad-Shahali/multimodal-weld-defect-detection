@@ -1,0 +1,6 @@
+data/interim/
+data/processed/
+outputs/
+__pycache__/
+.ipynb_checkpoints/
+*.parquet

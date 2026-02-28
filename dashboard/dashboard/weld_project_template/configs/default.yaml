@@ -1,0 +1,42 @@
+project:
+  name: weld-hackathon
+paths:
+  raw_train_good: data/raw/train/good_weld
+  raw_train_defect: data/raw/train/defect_weld
+  raw_test: data/raw/test
+  index: data/interim/index/run_index.jsonl
+  inventory: data/interim/index/inventory.csv
+  # When using manifest-based indexing (from preprocessed pipeline):
+  manifest: data/interim/manifest.csv
+  split_dict: data/interim/split_dict.json
+  dataset_meta: data/interim/dataset_meta.json
+  norm_stats: data/interim/norm_stats.json
+  # If raw data moved: set to parent of good_weld/defect_data_weld (replaces /Volumes/... in manifest paths)
+  data_root: null
+  features: data/processed/features/features.parquet
+  chunks: data/processed/chunks/chunks.parquet
+processing:
+  active_window:
+    current_threshold_a: 5.0
+    pad_seconds: 0.75
+  resample_hz: 25
+audio:
+  sr: null
+  n_mels: 128
+  n_fft: 2048
+  hop_length: 512
+video:
+  sample_fps: 2
+  frame_size: 224
+dashboard:
+  cache_dir: outputs/reports/dashboards/cache
+  points_3d: outputs/reports/dashboards/points_3d.json
+  # Pipeline output paths (steps 7, 11, 12, 13, 14)
+  tabular: outputs/tabular
+  checkpoints: outputs/checkpoints
+  eval: outputs/eval
+  predictions: outputs/predictions
+  reports: outputs/reports
+  dataset: data/interim
+  sample_data: /Users/kiana/Desktop/08-17-22-0011-00
+  sensor_stats: /Users/kiana/Library/Containers/ru.keepcoder.Telegram/Data/tmp/sensor_stats.csv
