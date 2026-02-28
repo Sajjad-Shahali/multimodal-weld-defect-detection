@@ -2,3 +2,8 @@
 /defect-weld
 /good_weld
 /weld
+/dataset/defect-weld
+/dataset/good-weld
+/output
+/__pycache__
+/pipeline/__pycache__
