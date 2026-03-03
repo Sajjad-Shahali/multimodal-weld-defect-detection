@@ -1,5 +1,10 @@
 $ErrorActionPreference = 'Stop'
 
+# Dashboard launcher (non-functional notes):
+# - This script assumes a Windows PowerShell environment.
+# - Paths are resolved from this file's repo root to keep behavior stable.
+# - The commands below are unchanged and preserve existing workflow.
+
 # Always run dashboard from the repo venv
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repo

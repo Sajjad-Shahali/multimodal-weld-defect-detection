@@ -52,13 +52,29 @@ def _label_name(code: str) -> str:
 
 # Custom CSS for AgGrid (injected into iframe - required for styling to apply)
 AGGRID_CUSTOM_CSS = """
-.ag-root-wrapper { border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.3); font-family: 'Inter', -apple-system, sans-serif; }
-.ag-header, .ag-header-row { background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%) !important; color: #0f172a !important; }
-.ag-header-cell { font-weight: 600 !important; font-size: 0.85rem !important; padding: 12px 16px !important; }
-.ag-row.ag-row-odd { background: rgba(30, 41, 59, 0.6) !important; }
-.ag-row.ag-row-even { background: rgba(15, 23, 42, 0.8) !important; }
-.ag-row:hover { background: rgba(245, 158, 11, 0.15) !important; }
-.ag-cell { border-color: rgba(245, 158, 11, 0.15) !important; padding: 10px 16px !important; font-size: 0.9rem !important; }
+.ag-root-wrapper {
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
+  font-family: 'Inter', -apple-system, sans-serif;
+}
+.ag-header, .ag-header-row {
+  background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%) !important;
+  color: #0f172a !important;
+}
+.ag-header-cell {
+  font-weight: 600 !important;
+  font-size: 0.85rem !important;
+  padding: 12px 16px !important;
+}
+.ag-row.ag-row-odd { background: rgba(30, 41, 59, 0.58) !important; }
+.ag-row.ag-row-even { background: rgba(15, 23, 42, 0.82) !important; }
+.ag-row:hover { background: rgba(245, 158, 11, 0.14) !important; }
+.ag-cell {
+  border-color: rgba(245, 158, 11, 0.14) !important;
+  padding: 10px 16px !important;
+  font-size: 0.9rem !important;
+}
 """
 
 # -----------------------------

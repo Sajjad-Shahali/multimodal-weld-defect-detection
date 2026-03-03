@@ -1,18 +1,23 @@
+# Local data / experiment artifacts
 /sampleData
+/test_data-20260228T060326Z-1-001
 /defect-weld
 /good_weld
-/weld
 /dataset/defect-weld
 /dataset/good-weld
 /output
+
+# Local virtual environment snapshot
+/weld
+
+# Python caches
 /__pycache__
 /pipeline/__pycache__
-/dashboard/__MACOSX
-/dashboard/__MACOSX
-/dashboard/__MACOSX
-/dashboard/__MACOSX
+
+# Dashboard local sample assets
 /dashboard/weld_project_template/assets/sample_data
 /dashboard/weld_project_template/data/raw/train/good_weld/RUN_YYYYMMDD_HHMMSS_0000-00
-/test_data-20260228T060326Z-1-001
+
+# Archive residue
 /dashboard/__MACOSX
 /dashboard/__MACOSX/dashboard/weld_project_template/data/raw/train

@@ -25,6 +25,11 @@ Requires
 Author: Hackathon Team — Final Submission Script
 """
 
+# IMPORTANT MAINTENANCE NOTE:
+# This file contains score-sensitive post-processing and submission formatting.
+# Keep thresholds, formulas, aggregation, and output schema unchanged unless
+# intentionally performing a behavior-changing experiment.
+
 # ═══════════════════════════════════════════════════════════════════════
 #  IMPORTS
 # ═══════════════════════════════════════════════════════════════════════

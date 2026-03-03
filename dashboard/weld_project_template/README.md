@@ -3,6 +3,12 @@
 Drop new run folders under `data/raw/...` and run the scripts in `scripts/`.
 This structure is designed to stay stable as you add more data.
 
+## Path Assumptions
+
+- Paths in `configs/default.yaml` are resolved relative to the template root unless they are absolute.
+- On Windows, keep backslash/drive-letter paths in config only when intentionally targeting fixed local locations.
+- Keeping paths relative is recommended for portability across machines.
+
 ## Expected run folder format
 
 Each run is a folder containing:

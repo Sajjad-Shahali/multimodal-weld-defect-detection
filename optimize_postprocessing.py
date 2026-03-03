@@ -29,6 +29,10 @@ Usage
   python optimize_postprocessing.py --config config.yaml    # explicit config
 """
 
+# IMPORTANT MAINTENANCE NOTE:
+# This script intentionally searches score-sensitive post-processing settings.
+# Any change to formulas, metrics, or search space may change final predictions.
+
 import argparse
 import json
 import os

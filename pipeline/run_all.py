@@ -1,15 +1,15 @@
 """
-run_all.py — Run the full weld-defect detection pipeline.
+run_all.py - Run the full weld-defect detection pipeline.
 
-Phase 1 (steps 1–6):  Data ingestion → preprocessing → dataset generation
-Phase 2 (steps 7–11): Tabular baseline → model training
-Phase 3 (steps 12–14): Calibration → evaluation → submission
+Phase 1 (steps 1-6):  Data ingestion -> preprocessing -> dataset generation
+Phase 2 (steps 7-11): Tabular baseline -> model training
+Phase 3 (steps 12-14): Calibration -> evaluation -> submission
 
 Usage:
     cd /Users/aliivaezii/Documents/I3P
     source .venv/bin/activate
 
-    # Full pipeline (Phase 1 only — default)
+    # Full pipeline (Phase 1 only - default)
     python -m pipeline.run_all
 
     # Full pipeline (all phases)

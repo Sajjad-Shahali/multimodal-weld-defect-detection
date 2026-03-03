@@ -17,6 +17,10 @@ Usage
   python fix_submission.py --input submission.csv --output submission_fixed.csv
 """
 
+# IMPORTANT MAINTENANCE NOTE:
+# This utility enforces logical consistency between pred_label_code and p_defect.
+# Keep rule semantics and CSV schema unchanged for backward compatibility.
+
 import argparse
 import csv
 
