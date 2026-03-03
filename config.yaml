@@ -3,7 +3,7 @@
 # ============================================================
 
 # --- Paths ---
-data_root: "dataset"  # full dataset (good_weld + defect-weld)
+data_root: "dataset-test"  # full dataset (good_weld + defect-weld)
 output_root: "output"       # all generated artefacts go here
 
 # --- Label mapping (code → human name) ---
