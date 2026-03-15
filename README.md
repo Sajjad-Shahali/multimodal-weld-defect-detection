@@ -1,7 +1,14 @@
-# Multimodal Weld Defect Detection
-## Therness Hackathon - DATA forge
+# WeldFusionNet - Multimodal Weld Defect Detection
 
-A reproducible multimodal weld defect detection pipeline combining acoustic, visual, and sensor signals via a multitask deep learning model.
+`MIT License` `Python 3.9+` `PyTorch` `Streamlit` `LightGBM`
+
+`February 2026` | `Therness Hackathon - DATA forge`
+
+`Audio + Video + Sensor Fusion` `OpenCV` `librosa` `Plotly`
+
+**Authors:** Ali Vaezi, Sajjad Shahali, Kiana Salimi
+
+WeldFusionNet is a Streamlit-based multimodal deep learning system for automated weld defect classification using sensor, audio, and video data, with data indexing, media and sensor feature pipelines, interactive analytics, and batch or single-run inference for manufacturing quality control.
 
 ---
 
