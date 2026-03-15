@@ -1,10 +1,16 @@
 # WeldFusionNet - Multimodal Weld Defect Detection
 
-`MIT License` `Python 3.9+` `PyTorch` `Streamlit` `LightGBM`
+![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-84CC16?style=for-the-badge)
 
 `February 2026` | `Therness Hackathon - DATA forge`
 
-`Audio + Video + Sensor Fusion` `OpenCV` `librosa` `Plotly`
+![Audio](https://img.shields.io/badge/Audio-Processing-4F46E5?style=for-the-badge)
+![Video](https://img.shields.io/badge/Video-Analysis-F97316?style=for-the-badge)
+![Sensor](https://img.shields.io/badge/Sensor-Fusion-0F766E?style=for-the-badge)
+![Plotly](https://img.shields.io/badge/Plotly-Analytics-3F4F75?style=for-the-badge&logo=plotly&logoColor=white)
 
 **Authors:** Ali Vaezi, Sajjad Shahali, Kiana Salimi
 
