@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-84CC16?style=for-the-badge)](LICENSE)
 
 > **Therness Hackathon - DATA forge | February 2026**  
-> Streamlit-based multimodal deep learning for automated weld quality inspection and defect classification using sensor, audio, and video data.  
+> multimodal deep learning for automated weld quality inspection and defect classification using sensor, audio, and video data.  
 >
 > **Team:** Ali Vaezi, Sajjad Shahali, Kiana Salimi
 
